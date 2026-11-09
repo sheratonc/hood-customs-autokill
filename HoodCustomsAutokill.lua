@@ -1,10 +1,21 @@
 -- Hood Customs Free For All — Autokill
 -- UI: LinoriaLib (violin-suzutsuki fork)
 -- Combat routes through a single remote: ReplicatedStorage.MainEvent:FireServer(action, ...)
---   "Shoot"  -> {ORIGIN=Vector3, AIM=Vector3, INDEX=number, HITS={[pellet]=hitcode}}   hitcode 1 = landed
---   "Reload" -> reloads the equipped gun
---   "Stomp"  -> finisher; server resolves the KO'd player beneath your LowerTorso
--- Kill model in this framework: gun damage drops the target to K.O, Stomp finishes.
+--
+-- "Shoot" is CLIENT-AUTHORITATIVE hit reg. You raycast locally and tell the server which model/part
+-- you hit; it trusts the descriptor. Payload:
+--   { ORIGIN=Vector3, AIM=Vector3, INDEX=number, HITS={ { PELLET, MODEL, PART, POSITION }, ... } }
+--   INDEX must mirror the gun framework's shared shot counter or the server replies ERROR_CLIENT_UNSYNCED_SERVER.
+--   This means silent-aim works from anywhere in range — no teleport needed to land damage.
+--
+-- "Stomp" is POSITIONAL. The client raycasts DOWN from LowerTorso to find a body, then fires
+--   MainEvent:FireServer("Stomp") with NO target argument; the server resolves the K.O'd victim beneath
+--   your REPLICATED position. So the finisher needs you standing over the body — we micro-blink onto the
+--   target only for the stomp, then return. Stomp carries no position payload, so this blink doesn't trip
+--   the Shoot remote's origin-vs-position desync check.
+--
+-- Kill model: silent-aim shots drop the target to K.O, the stomp finishes.
+-- Real health lives in BodyEffects.Health_CLIENT (Humanoid.Health stays 100 as a decoy).
 
 local repo = 'https://raw.githubusercontent.com/violin-suzutsuki/LinoriaLib/main/'
 local Library      = loadstring(game:HttpGet(repo .. 'Library.lua'))()
@@ -18,20 +29,22 @@ local ReplicatedStorage= game:GetService('ReplicatedStorage')
 local LocalPlayer = Players.LocalPlayer
 local MainEvent   = ReplicatedStorage:WaitForChild('MainEvent')
 
+local GUN_RANGE = 200   -- server-side gun range cap from MainModule.GUN_RANGE
+
 -- kill any previous instance before building a new one (safe re-execute)
 if getgenv().HoodCustoms_Unload then
     pcall(getgenv().HoodCustoms_Unload)
 end
 
-local Connections = {}   -- every connection we make lives here so teardown can drop them all
+local Connections = {}    -- every connection we make lives here so teardown can drop them all
 local Unloaded    = false -- the loop checks this and bails the instant we tear down
 
--- ============================================================= helpers
+-- ============================================================= gun state (shared shot counter)
 
--- The gun framework keeps ONE shared state table that owns the shot counter (INDEX).
--- The server stays synced to that counter. If we invent our own index the server rejects
--- the shot with ERROR_CLIENT_UNSYNCED_SERVER, so we grab the real table out of the GC and
--- mirror its INDEX — incrementing it the same way the game's own gun script does.
+-- The gun framework keeps ONE shared state table that owns the shot counter (INDEX) and the PENDING
+-- map of outstanding shots. The server stays synced to that counter. If we invent our own index the
+-- server rejects the shot as UNSYNCED, so we grab the real table out of the GC, advance its INDEX the
+-- same way the game's own script does, and seed PENDING[idx] so settleShot doesn't crash on the reply.
 local GunState = nil
 local function getGunState()
     if GunState and type(GunState) == 'table' and rawget(GunState, 'INDEX') ~= nil then
@@ -52,46 +65,90 @@ local function getGunState()
     return GunState
 end
 
+-- advance the real counter so the game's own gun script stays in sync, seed PENDING, return the index
 local function nextShotIndex()
     local st = getGunState()
     if not st then return nil end
-    st.INDEX += 1          -- advance the real counter so the game's own script stays synced too
+    st.INDEX += 1
+    -- PENDING entry MUST carry a KNOCKED table; settleShot does `for v in next, entry.KNOCKED`
+    -- and errors with "invalid argument #1 to 'next'" if it's nil.
+    if type(rawget(st, 'PENDING')) == 'table' then
+        st.PENDING[st.INDEX] = { TARGET = nil, KNOCKED = {} }
+    end
     return st.INDEX
 end
 
-local function alive(char)
-    if not char then return false end
-    local hum = char:FindFirstChildOfClass('Humanoid')
-    return hum and hum.Health > 0 and char:FindFirstChild('HumanoidRootPart') ~= nil
+-- ============================================================= target / state helpers
+
+local function bodyEffects(char)
+    return char and char:FindFirstChild('BodyEffects')
+end
+
+local function healthOf(char)
+    local be = bodyEffects(char)
+    local hc = be and be:FindFirstChild('Health_CLIENT')
+    return hc and hc.Value or nil
 end
 
 local function isKO(char)
-    local be = char and char:FindFirstChild('BodyEffects')
+    local be = bodyEffects(char)
     local ko = be and be:FindFirstChild('K.O')
-    return ko and ko.Value == true
+    return ko ~= nil and ko.Value == true
+end
+
+-- a character we can act on: present in the world with a root part
+local function validTarget(char)
+    return char ~= nil
+        and char.Parent ~= nil
+        and char:FindFirstChild('HumanoidRootPart') ~= nil
+end
+
+-- part we aim the silent-aim shot at
+local function aimPart(char)
+    return char:FindFirstChild('UpperTorso') or char:FindFirstChild('HumanoidRootPart')
+end
+
+-- part the finisher blink should land on top of
+local function stompPart(char)
+    return char:FindFirstChild('LowerTorso') or char:FindFirstChild('UpperTorso') or char:FindFirstChild('HumanoidRootPart')
 end
 
 -- my own gate for firing Stomp (mirrors the game's client stomp() checks)
 local function canStomp()
     local char = LocalPlayer.Character
-    local be = char and char:FindFirstChild('BodyEffects')
+    local be = bodyEffects(char)
     if not be then return false end
-    return be['K.O'].Value == false
-        and be.Reloading_CLIENT.Value == false
-        and be.Attacking_CLIENT.Value == false
-        and be.Grabbed.Value == nil
-        and char:FindFirstChild('GRABBING_CONSTRAINT') == nil
+    local ok = true
+    pcall(function()
+        ok = be['K.O'].Value == false
+            and be.Reloading_CLIENT.Value == false
+            and be.Attacking_CLIENT.Value == false
+            and be.Grabbed.Value == nil
+            and char:FindFirstChild('GRABBING_CONSTRAINT') == nil
+    end)
+    return ok
 end
 
--- find a usable gun (Tool holding a GunData module) in character or backpack
+-- ============================================================= gun detection
+
+-- real guns hold a Script with an Ammo value (tool.Script.Ammo.CLIENT.Value). GunData does NOT exist.
+local function isGun(t)
+    if not (t and t:IsA('Tool')) then return false end
+    local s = t:FindFirstChild('Script')
+    return s ~= nil and s:FindFirstChild('Ammo') ~= nil
+end
+
 local function findGun()
     local char = LocalPlayer.Character
     if char then
         local t = char:FindFirstChildOfClass('Tool')
-        if t and t:FindFirstChild('GunData') then return t, true end
+        if isGun(t) then return t, true end
     end
-    for _, t in ipairs(LocalPlayer.Backpack:GetChildren()) do
-        if t:IsA('Tool') and t:FindFirstChild('GunData') then return t, false end
+    local bp = LocalPlayer:FindFirstChild('Backpack')
+    if bp then
+        for _, t in ipairs(bp:GetChildren()) do
+            if isGun(t) then return t, false end
+        end
     end
     return nil, false
 end
@@ -103,86 +160,58 @@ local function gunAmmo(tool)
     return client and client.Value or 0
 end
 
-local function targetParts(char)
-    local hrp  = char:FindFirstChild('HumanoidRootPart')
-    local torso= char:FindFirstChild('Torso') or char:FindFirstChild('LowerTorso') or hrp
-    return hrp, torso
-end
-
--- resolve the player we're attacking: selected in dropdown, or nearest if enabled
-local function resolveTarget()
-    local myChar = LocalPlayer.Character
-    local myHRP = myChar and myChar:FindFirstChild('HumanoidRootPart')
-    if not myHRP then return nil end
-
-    -- an explicit dropdown pick always wins; "Nearest" is only the fallback
-    local name = Options.TargetPlayer.Value
-    if name and name ~= '' then
-        local plr = Players:FindFirstChild(name)
-        if plr and alive(plr.Character) then return plr end
-        -- selected player is dead/gone; fall through to Nearest only if it's enabled
+-- world position of the gun muzzle; Handle carries a "Muzzle" CFrame attribute
+local function muzzleOrigin(tool)
+    local handle = tool and tool:FindFirstChild('Handle')
+    if not handle then return nil end
+    local mz = handle:GetAttribute('Muzzle')
+    if typeof(mz) == 'CFrame' then
+        return (handle.CFrame * mz.Position)
     end
-
-    if Toggles.Nearest.Value then
-        local best, bestD = nil, math.huge
-        local maxD = Options.MaxDistance.Value
-        for _, plr in ipairs(Players:GetPlayers()) do
-            if plr ~= LocalPlayer and alive(plr.Character) then
-                local hrp = plr.Character:FindFirstChild('HumanoidRootPart')
-                local d = (hrp.Position - myHRP.Position).Magnitude
-                if d < bestD and d <= maxD then best, bestD = plr, d end
-            end
-        end
-        return best
-    end
-
-    return nil
+    return handle.Position
 end
 
 -- ============================================================= combat actions
 
-local function equipGun(tool, inChar)
-    if inChar then return end
+local function equipGun(tool)
     local hum = LocalPlayer.Character and LocalPlayer.Character:FindFirstChildOfClass('Humanoid')
     if hum then pcall(function() hum:EquipTool(tool) end) end
 end
 
+-- silent-aim shot: real muzzle origin, torso aim, real HITS descriptor the server trusts
 local function fireShot(tool, targetChar)
-    local handle = tool:FindFirstChild('Handle')
-    local _, torso = targetParts(targetChar)
-    if not handle or not torso then return end
+    local origin = muzzleOrigin(tool)
+    local part   = aimPart(targetChar)
+    if not origin or not part then return false end
 
     local idx = nextShotIndex()
-    if not idx then return end   -- no synced gun state yet; skip rather than desync the server
+    if not idx then return false end   -- no synced gun state yet; skip rather than desync the server
 
-    -- single pellet straight at the torso, flagged as a landed hit (code 1)
+    local pos = part.Position
     MainEvent:FireServer('Shoot', {
-        ORIGIN = handle.Position,
-        AIM    = torso.Position,
+        ORIGIN = origin,
+        AIM    = pos,
         INDEX  = idx,
-        HITS   = { [1] = 1 },
+        HITS   = { { PELLET = 1, MODEL = targetChar, PART = part, POSITION = pos } },
     })
+    return true
 end
 
 local function doStomp()
     MainEvent:FireServer('Stomp')
 end
 
--- ============================================================= teleport
-
-local SavedCFrame = nil
-
-local function tpTo(targetChar, offset)
-    local myChar = LocalPlayer.Character
-    local myHRP  = myChar and myChar:FindFirstChild('HumanoidRootPart')
-    local tHRP   = targetChar and targetChar:FindFirstChild('HumanoidRootPart')
-    if not myHRP or not tHRP then return end
-    if not SavedCFrame then SavedCFrame = myHRP.CFrame end
-    myHRP.CFrame = tHRP.CFrame * offset
-    myHRP.AssemblyLinearVelocity = Vector3.zero
+local function doReload()
+    MainEvent:FireServer('Reload')
 end
 
-local function tpBack()
+-- ============================================================= finisher blink
+
+-- Only teleport for the stomp. Blink on top of the body, let our position replicate, fire Stomp
+-- (which the server resolves by our position), wait out the stomp, then snap back.
+local SavedCFrame = nil
+
+local function restorePosition()
     local myChar = LocalPlayer.Character
     local myHRP  = myChar and myChar:FindFirstChild('HumanoidRootPart')
     if myHRP and SavedCFrame then
@@ -190,6 +219,26 @@ local function tpBack()
         myHRP.AssemblyLinearVelocity = Vector3.zero
     end
     SavedCFrame = nil
+end
+
+local function finisher(targetChar)
+    local myChar = LocalPlayer.Character
+    local myHRP  = myChar and myChar:FindFirstChild('HumanoidRootPart')
+    local body   = stompPart(targetChar)
+    if not myHRP or not body then return end
+    if not canStomp() then return end
+
+    SavedCFrame = myHRP.CFrame
+    -- sit just above the body so our LowerTorso raycast finds it
+    myHRP.CFrame = CFrame.new(body.Position + Vector3.new(0, 2, 0))
+    myHRP.AssemblyLinearVelocity = Vector3.zero
+
+    task.wait(0.2)   -- let the server see our new position
+    if isKO(targetChar) and canStomp() then
+        doStomp()
+    end
+    task.wait(0.65)  -- stomp anim (~0.55) + settle
+    restorePosition()
 end
 
 -- ============================================================= UI
@@ -214,23 +263,21 @@ Box:AddToggle('Enabled', { Text = 'Autokill enabled', Default = false, Tooltip =
 Box:AddDropdown('TargetPlayer', {
     SpecialType = 'Player',
     Text = 'Target player',
-    Tooltip = 'Who to kill (ignored when Nearest is on)',
+    Tooltip = 'Who to kill (ignored when Nearest is on, or used as priority)',
     ExcludeLocalPlayer = true,
 })
 
 Box:AddToggle('Nearest', { Text = 'Fallback to nearest', Default = true, Tooltip = 'When no dropdown target is picked (or it died), auto-target the closest living player' })
-Box:AddToggle('UseGun',  { Text = 'Shoot to down',  Default = true, Tooltip = 'Fire the gun at the target until they K.O' })
-Box:AddToggle('UseStomp',{ Text = 'Stomp to finish',Default = true, Tooltip = 'Fire the finisher once the target is downed' })
+Box:AddToggle('UseGun',  { Text = 'Shoot to down',  Default = true, Tooltip = 'Silent-aim the gun at the target until they K.O' })
+Box:AddToggle('UseStomp',{ Text = 'Stomp to finish',Default = true, Tooltip = 'Blink onto the body and stomp once the target is downed' })
 Box:AddToggle('AutoEquip',{ Text = 'Auto-equip gun', Default = true, Tooltip = 'Pull a gun from the backpack if none is held' })
 Box:AddToggle('AutoReload',{ Text = 'Auto-reload',  Default = true, Tooltip = 'Reload when the clip is empty' })
-Box:AddToggle('TPKill',  { Text = 'Teleport to target', Default = true, Tooltip = 'Blink onto the target to guarantee range + stomp alignment' })
-Box:AddToggle('Return',  { Text = 'Return after kill',  Default = false, Tooltip = 'Teleport back to your original spot after each finish' })
 
-Box:AddSlider('MaxDistance', { Text = 'Max distance', Default = 300, Min = 10, Max = 2000, Rounding = 0, Suffix = ' studs' })
-Box:AddSlider('FireDelay',   { Text = 'Action delay', Default = 0.08, Min = 0.03, Max = 0.6, Rounding = 2, Suffix = 's' })
+Box:AddSlider('MaxDistance', { Text = 'Max distance', Default = 200, Min = 10, Max = 500, Rounding = 0, Suffix = ' studs' })
+Box:AddSlider('FireDelay',   { Text = 'Shot delay', Default = 0.12, Min = 0.03, Max = 0.6, Rounding = 2, Suffix = 's' })
 
 local FarmBox = Tabs.Main:AddRightGroupbox('Stomp farm')
-FarmBox:AddToggle('StompFarm', { Text = 'Stomp anyone under me', Default = false, Tooltip = 'Pure finisher spam — stomps any downed body beneath you' })
+FarmBox:AddToggle('StompFarm', { Text = 'Stomp anyone under me', Default = false, Tooltip = 'Pure finisher spam — stomps any downed body beneath you (no blink)' })
 
 Box:AddLabel('Toggle autokill'):AddKeyPicker('AutokillKey', { Default = 'K', Mode = 'Toggle', Text = 'Autokill', SyncToggleState = true })
 
@@ -239,67 +286,95 @@ Box:AddButton('Unload', function() Library:Unload() end)  -- routes through Libr
 
 -- ============================================================= logic
 
-local busy = false
+local busy      = false
+local lastShot  = 0
+local lastStomp = 0
+
+-- resolve the player we're attacking: dropdown pick wins, nearest living is the fallback
+local function resolveTarget()
+    local myChar = LocalPlayer.Character
+    local myHRP = myChar and myChar:FindFirstChild('HumanoidRootPart')
+    if not myHRP then return nil end
+
+    local maxD = Options.MaxDistance.Value
+
+    local name = Options.TargetPlayer.Value
+    if name and name ~= '' then
+        local plr = Players:FindFirstChild(name)
+        if plr and validTarget(plr.Character) then return plr end
+        -- selected player is dead/gone; fall through to Nearest only if it's enabled
+    end
+
+    if Toggles.Nearest.Value then
+        local best, bestD = nil, math.huge
+        for _, plr in ipairs(Players:GetPlayers()) do
+            if plr ~= LocalPlayer and validTarget(plr.Character) then
+                local hrp = plr.Character:FindFirstChild('HumanoidRootPart')
+                local d = (hrp.Position - myHRP.Position).Magnitude
+                if d < bestD and d <= maxD then best, bestD = plr, d end
+            end
+        end
+        return best
+    end
+
+    return nil
+end
 
 local function step()
     if Unloaded or busy then return end
 
-    -- pure stomp farm: stomp whatever downed body is under us
-    if Toggles.StompFarm.Value and canStomp() then
+    -- pure stomp farm: stomp whatever downed body is already beneath us (no blink)
+    if Toggles.StompFarm.Value and canStomp() and (os.clock() - lastStomp) > 0.6 then
         doStomp()
+        lastStomp = os.clock()
     end
 
-    if not Toggles.Enabled.Value then
-        if SavedCFrame then tpBack() end
-        return
-    end
+    if not Toggles.Enabled.Value then return end
 
     local target = resolveTarget()
-    if not target or not alive(target.Character) then
-        if Toggles.Return.Value and SavedCFrame then tpBack() end
-        return
-    end
+    if not target or not validTarget(target.Character) then return end
 
     busy = true
-    local ok = pcall(function()
+    pcall(function()
         local tChar = target.Character
-        local delayT = Options.FireDelay.Value
+        local myChar = LocalPlayer.Character
+        local myHRP = myChar and myChar:FindFirstChild('HumanoidRootPart')
+        if not myHRP then return end
 
+        -- finisher phase
         if isKO(tChar) then
-            -- finisher phase
-            if Toggles.UseStomp.Value then
-                if Toggles.TPKill.Value then tpTo(tChar, CFrame.new(0, 3, 0)) end
-                task.wait(0.05)
-                if canStomp() then doStomp() end
-                task.wait(0.15)
-                if Toggles.Return.Value then tpBack() end
-            end
+            if Toggles.UseStomp.Value then finisher(tChar) end
             return
         end
 
         -- damage phase
-        if Toggles.UseGun.Value then
-            local gun, inChar = findGun()
-            if gun then
-                if not inChar and Toggles.AutoEquip.Value then
-                    equipGun(gun, inChar)
-                    task.wait(0.1)
-                    gun, inChar = findGun()
-                end
-                if gun and inChar then
-                    if gunAmmo(gun) <= 0 then
-                        if Toggles.AutoReload.Value then MainEvent:FireServer('Reload') ; task.wait(0.25) end
-                    else
-                        if Toggles.TPKill.Value then tpTo(tChar, CFrame.new(0, 0, 4)) end
-                        fireShot(gun, tChar)
-                    end
-                end
-            end
+        if not Toggles.UseGun.Value then return end
+
+        local gun, inChar = findGun()
+        if not gun then return end
+        if not inChar then
+            if not Toggles.AutoEquip.Value then return end
+            equipGun(gun)
+            task.wait(0.1)
+            gun, inChar = findGun()
         end
-        task.wait(delayT)
+        if not (gun and inChar) then return end
+
+        if gunAmmo(gun) <= 0 then
+            if Toggles.AutoReload.Value then doReload() ; task.wait(0.3) end
+            return
+        end
+
+        local part = aimPart(tChar)
+        if not part then return end
+        local d = (part.Position - myHRP.Position).Magnitude
+        if d > math.min(Options.MaxDistance.Value, GUN_RANGE) then return end
+
+        if (os.clock() - lastShot) >= Options.FireDelay.Value then
+            if fireShot(gun, tChar) then lastShot = os.clock() end
+        end
     end)
     busy = false
-    if not ok then task.wait(0.1) end
 end
 
 Connections.Heartbeat = RunService.Heartbeat:Connect(function()
@@ -321,8 +396,8 @@ local function teardown()
         Connections[key] = nil
     end
 
-    -- put us back where we started if a teleport left us parked on someone
-    pcall(tpBack)
+    -- put us back if a finisher blink left us parked on someone
+    pcall(restorePosition)
 
     getgenv().HoodCustoms_Unload = nil
 end
