@@ -385,6 +385,98 @@ local function finisher(targetChar)
     restorePosition()
 end
 
+-- ============================================================= blink-to-shoot
+--
+-- The server validates the Shoot payload's ORIGIN against our REPLICATED position: forging an
+-- origin next to a far target is silently dropped (proven live — 5 forged shots, zero damage).
+-- The only origin that deals damage is our real muzzle. So to hit past GUN_RANGE or through a wall
+-- we have to actually be there. This mirrors the finisher blink: save our spot, teleport onto a
+-- clean firing angle a few studs off the target, empty the clip from the real muzzle (every shot an
+-- honest muzzle->torso cast that the server can't flag), then snap back.
+
+-- find a spot near the target with unobstructed line of sight to the torso. Tries a ring of angles
+-- around them at torso height, then straight overhead, and returns the first that casts clean.
+local function clearShotSpot(targetChar)
+    local part = aimPart(targetChar)
+    if not part then return nil end
+    local tpos = part.Position
+
+    local filter = { LocalPlayer.Character, workspace.CurrentCamera }
+    local ignored = workspace:FindFirstChild('Ignored')
+    if ignored then table.insert(filter, ignored) end
+    local params = RaycastParams.new()
+    params.FilterType = Enum.RaycastFilterType.Exclude
+    params.FilterDescendantsInstances = filter
+    params.IgnoreWater = true
+
+    local radius = 9
+    for i = 0, 7 do
+        local ang = (i / 8) * math.pi * 2
+        local spot = tpos + Vector3.new(math.cos(ang) * radius, 0, math.sin(ang) * radius)
+        local dir = tpos - spot
+        if dir.Magnitude > 1e-3 then
+            local res   = workspace:Raycast(spot, dir, params)
+            local model = res and hitModelFromInstance(res.Instance)
+            if model == targetChar then return spot, tpos end
+        end
+    end
+
+    -- fallback: directly above the torso, casting straight down
+    local spot = tpos + Vector3.new(0, radius, 0)
+    local res   = workspace:Raycast(spot, tpos - spot, params)
+    local model = res and hitModelFromInstance(res.Instance)
+    if model == targetChar then return spot, tpos end
+
+    return nil
+end
+
+-- teleport in, empty what the clip holds into them from point blank, teleport back. Re-anchors to a
+-- fresh clear spot before every shot so the target can't juke back behind cover mid-burst, and bails
+-- the instant they go K.O (the finisher takes it from there) or the clip runs dry.
+local function blinkShoot(tool, targetChar)
+    local myChar = LocalPlayer.Character
+    local myHRP  = myChar and myChar:FindFirstChild('HumanoidRootPart')
+    if not myHRP then return end
+    if not validTarget(targetChar) or isKO(targetChar) then return end
+    if ShotsLeft <= 0 then return end   -- dry: let the normal reload flow handle it next tick
+
+    SavedCFrame = SavedCFrame or myHRP.CFrame
+
+    -- stand us upright so our stance never throws the muzzle cast off
+    local myHum = myChar:FindFirstChildOfClass('Humanoid')
+    if myHum then
+        pcall(function()
+            myHum.Sit = false
+            myHum.PlatformStand = false
+        end)
+    end
+
+    local fired  = 0
+    local budget = gunMaxAmmo(tool)
+    while fired < budget do
+        if Unloaded then break end
+        if not validTarget(targetChar) or isKO(targetChar) or isDead(targetChar) then break end
+        if ShotsLeft <= 0 then break end
+
+        local spot, tpos = clearShotSpot(targetChar)
+        if not spot then break end   -- no clean angle anywhere: don't strand us, bail to restore
+
+        myHRP.CFrame = CFrame.new(spot, tpos)
+        myHRP.AssemblyLinearVelocity = Vector3.zero
+        task.wait()   -- one frame so the welded tool/handle follows our new CFrame
+
+        if fireShot(tool, targetChar) then
+            ShotsLeft = ShotsLeft - 1
+            fired = fired + 1
+        end
+
+        local cd = gunCooldown()
+        task.wait(cd and (cd + 0.03) or 0.2)
+    end
+
+    restorePosition()
+end
+
 -- ============================================================= spectate
 -- Pure camera watch: point CurrentCamera.CameraSubject at the chosen player's Humanoid. This moves
 -- nothing about our own character — it just makes the camera follow them, exactly like the spectate
@@ -454,6 +546,7 @@ Box:AddDropdown('TargetPlayer', {
 
 Box:AddToggle('Nearest', { Text = 'Fallback to nearest', Default = true, Tooltip = 'When no dropdown target is picked (or it died), auto-target the closest living player' })
 Box:AddToggle('UseGun',  { Text = 'Shoot to down',  Default = true, Tooltip = 'Silent-aim the gun at the target until they K.O' })
+Box:AddToggle('BlinkShoot',{ Text = 'Blink to shoot', Default = true, Tooltip = 'If the target is out of range or behind a wall, blink point-blank onto them, empty the clip, and blink back. This is the "force hit" — it lands damage through geometry and past the gun range cap.' })
 Box:AddToggle('UseStomp',{ Text = 'Stomp to finish',Default = true, Tooltip = 'Blink onto the body and stomp once the target is downed' })
 Box:AddToggle('AutoEquip',{ Text = 'Auto-equip gun', Default = true, Tooltip = 'Pull a gun from the backpack if none is held' })
 Box:AddToggle('AutoReload',{ Text = 'Auto-reload',  Default = true, Tooltip = 'Reload when the clip is empty' })
@@ -571,17 +664,27 @@ local function step()
         local part = aimPart(tChar)
         if not part then return end
         local d = (part.Position - myHRP.Position).Magnitude
-        if d > math.min(Options.MaxDistance.Value, GUN_RANGE) then return end
 
         -- respect whichever is slower: the user's slider or the gun's real server cooldown
         local cd = gunCooldown()
         local delay = Options.FireDelay.Value
         if cd then delay = math.max(delay, cd + 0.05) end
-        if (os.clock() - lastShot) >= delay then
-            if fireShot(gun, tChar) then
-                lastShot  = os.clock()
-                ShotsLeft = ShotsLeft - 1
-            end
+        if (os.clock() - lastShot) < delay then return end
+
+        local reach = math.min(Options.MaxDistance.Value, GUN_RANGE)
+
+        -- in range with clear LOS: honest shot from where we stand, no teleport
+        if d <= reach and fireShot(gun, tChar) then
+            lastShot  = os.clock()
+            ShotsLeft = ShotsLeft - 1
+            return
+        end
+
+        -- couldn't land from here (out of range, or a wall ate the muzzle cast). Force the hit:
+        -- blink point-blank, empty the clip through clean LOS, blink back. The finisher closes it.
+        if Toggles.BlinkShoot.Value and d <= Options.MaxDistance.Value then
+            blinkShoot(gun, tChar)
+            lastShot = os.clock()
         end
     end)
     busy = false
