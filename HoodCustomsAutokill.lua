@@ -18,6 +18,14 @@ local ReplicatedStorage= game:GetService('ReplicatedStorage')
 local LocalPlayer = Players.LocalPlayer
 local MainEvent   = ReplicatedStorage:WaitForChild('MainEvent')
 
+-- kill any previous instance before building a new one (safe re-execute)
+if getgenv().HoodCustoms_Unload then
+    pcall(getgenv().HoodCustoms_Unload)
+end
+
+local Connections = {}   -- every connection we make lives here so teardown can drop them all
+local Unloaded    = false -- the loop checks this and bails the instant we tear down
+
 -- ============================================================= helpers
 
 local ShotIndex = tick() % 1e6   -- unique-ish shot id seed; server uses INDEX to track shots
@@ -196,14 +204,14 @@ FarmBox:AddToggle('StompFarm', { Text = 'Stomp anyone under me', Default = false
 Box:AddLabel('Toggle autokill'):AddKeyPicker('AutokillKey', { Default = 'K', Mode = 'Toggle', Text = 'Autokill', SyncToggleState = true })
 
 Box:AddDivider()
-Box:AddButton('Unload', function() Library:Unload() end)
+Box:AddButton('Unload', function() Library:Unload() end)  -- routes through Library:OnUnload below
 
 -- ============================================================= logic
 
 local busy = false
 
 local function step()
-    if busy then return end
+    if Unloaded or busy then return end
 
     -- pure stomp farm: stomp whatever downed body is under us
     if Toggles.StompFarm.Value and canStomp() then
@@ -263,9 +271,37 @@ local function step()
     if not ok then task.wait(0.1) end
 end
 
-RunService.Heartbeat:Connect(function()
+Connections.Heartbeat = RunService.Heartbeat:Connect(function()
     pcall(step)
 end)
+
+-- ============================================================= teardown
+
+-- Full unload: stop the loop, drop every connection, restore position, free the global.
+-- The Unload button and the menu's X both call Library:Unload(), which fires this.
+local function teardown()
+    if Unloaded then return end
+    Unloaded = true
+
+    for key, conn in pairs(Connections) do
+        if typeof(conn) == 'RBXScriptConnection' then
+            pcall(function() conn:Disconnect() end)
+        end
+        Connections[key] = nil
+    end
+
+    -- put us back where we started if a teleport left us parked on someone
+    pcall(tpBack)
+
+    getgenv().HoodCustoms_Unload = nil
+end
+
+getgenv().HoodCustoms_Unload = function()
+    teardown()
+    pcall(function() Library:Unload() end)
+end
+
+Library:OnUnload(teardown)
 
 -- ============================================================= addons / config
 
