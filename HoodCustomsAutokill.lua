@@ -161,6 +161,13 @@ local function isGun(t)
     return s ~= nil and s:FindFirstChild('Ammo') ~= nil
 end
 
+-- magazine size straight off the tool (used to rank guns before we've tracked ammo)
+local function magSize(t)
+    local s = t and t:FindFirstChild('Script')
+    local m = s and s:FindFirstChild('MaxAmmo')
+    return (m and m.Value) or 0
+end
+
 local function findGun()
     local char = LocalPlayer.Character
     if char then
@@ -169,9 +176,16 @@ local function findGun()
     end
     local bp = LocalPlayer:FindFirstChild('Backpack')
     if bp then
+        -- prefer the biggest magazine: Revolver (6) over DoubleBarrel (2) means fewer
+        -- reload gaps mid-kill, so the target bleeds out faster.
+        local best, bestMax = nil, -1
         for _, t in ipairs(bp:GetChildren()) do
-            if isGun(t) then return t, false end
+            if isGun(t) then
+                local m = magSize(t)
+                if m > bestMax then best, bestMax = t, m end
+            end
         end
+        if best then return best, false end
     end
     return nil, false
 end
@@ -209,21 +223,65 @@ local function equipGun(tool)
     if hum then pcall(function() hum:EquipTool(tool) end) end
 end
 
--- silent-aim shot: real muzzle origin, torso aim, real HITS descriptor the server trusts
+-- walk up to a Model with a Humanoid, exactly like the gun script's getHitModel. This is how the
+-- game turns a raycast-hit part into the character that owns it.
+local function hitModelFromInstance(inst)
+    for _ = 1, 5 do
+        if inst == nil or inst == workspace then return nil end
+        if inst:IsA('Model') and inst:FindFirstChildOfClass('Humanoid') then
+            return inst
+        end
+        inst = inst.Parent
+    end
+    return nil
+end
+
+-- silent-aim shot that the server can't flag as a wallbang.
+--
+-- The gun's own client builds HITS by raycasting FROM THE MUZZLE along each pellet direction with
+-- the exclude list { workspace.Ignored, OwnCharacter, Camera } and recording whatever the ray
+-- actually strikes. The server re-runs that same cast to validate ORIGIN->POSITION/PART. Our old
+-- path fabricated a dead-center torso hit regardless of geometry, so any wall between us and the
+-- target made the server's re-validation land on the wall -> "wallbang" rejection.
+--
+-- Here we reproduce the game's cast verbatim: aim at the torso, cast muzzle->target with the exact
+-- same filter, and submit the REAL hit. On open ground the ray lands on the target and the shot is
+-- indistinguishable from a legit one. Behind cover the ray stops on the wall (model ~= target), so
+-- we fire nothing instead of forging a flagged shot.
 local function fireShot(tool, targetChar)
     local origin = muzzleOrigin(tool)
     local part   = aimPart(targetChar)
     if not origin or not part then return false end
 
+    local aim = part.Position
+    local delta = aim - origin
+    local mag = delta.Magnitude
+    if mag < 1e-3 then return false end
+    local dir = delta / mag
+
+    local filter = { LocalPlayer.Character, workspace.CurrentCamera }
+    local ignored = workspace:FindFirstChild('Ignored')
+    if ignored then table.insert(filter, ignored) end
+
+    local params = RaycastParams.new()
+    params.FilterType = Enum.RaycastFilterType.Exclude
+    params.FilterDescendantsInstances = filter
+    params.IgnoreWater = true
+
+    local result = workspace:Raycast(origin, dir * GUN_RANGE, params)
+    local model  = result and hitModelFromInstance(result.Instance)
+    if not model or model ~= targetChar then
+        return false   -- geometry in the way (or we'd clip someone else): skip, don't forge a hit
+    end
+
     local idx = nextShotIndex()
     if not idx then return false end   -- no synced gun state yet; skip rather than desync the server
 
-    local pos = part.Position
     MainEvent:FireServer('Shoot', {
         ORIGIN = origin,
-        AIM    = pos,
+        AIM    = aim,
         INDEX  = idx,
-        HITS   = { { PELLET = 1, MODEL = targetChar, PART = part, POSITION = pos } },
+        HITS   = { { PELLET = 1, MODEL = model, PART = result.Instance, POSITION = result.Position } },
     })
     return true
 end
