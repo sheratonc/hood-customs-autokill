@@ -29,7 +29,8 @@ local ReplicatedStorage= game:GetService('ReplicatedStorage')
 local LocalPlayer = Players.LocalPlayer
 local MainEvent   = ReplicatedStorage:WaitForChild('MainEvent')
 
-local GUN_RANGE = 200   -- server-side gun range cap from MainModule.GUN_RANGE
+local GUN_RANGE = 200          -- server-side gun range cap from MainModule.GUN_RANGE
+local GUN_RELOAD_TIME = 1.5    -- MainModule.GUN_RELOAD_TIME (full reload; non shell-reload guns)
 
 -- kill any previous instance before building a new one (safe re-execute)
 if getgenv().HoodCustoms_Unload then
@@ -166,11 +167,19 @@ local function findGun()
     return nil, false
 end
 
+-- Ammo.CLIENT is display-only and desyncs under our manual fire/reload path, so we read it
+-- ONLY to seed the counter the first time we pick up a gun. After that we track rounds ourselves.
 local function gunAmmo(tool)
     local s = tool and tool:FindFirstChild('Script')
     local ammo = s and s:FindFirstChild('Ammo')
     local client = ammo and ammo:FindFirstChild('CLIENT')
     return client and client.Value or 0
+end
+
+local function gunMaxAmmo(tool)
+    local s = tool and tool:FindFirstChild('Script')
+    local m = s and s:FindFirstChild('MaxAmmo')
+    return (m and m.Value) or 2
 end
 
 -- world position of the gun muzzle; Handle carries a "Muzzle" CFrame attribute
@@ -214,8 +223,47 @@ local function doStomp()
     MainEvent:FireServer('Stomp')
 end
 
-local function doReload()
-    MainEvent:FireServer('Reload')
+-- ---- ammo / reload tracking -----------------------------------------------------------
+-- The server refills exactly MaxAmmo rounds per Reload and rejects any shot past that, while
+-- the client's Ammo.CLIENT display stays frozen under our manual path. So we mirror the server's
+-- real ammo with our own counter: seed it from the display when a gun is first picked up, then
+-- decrement on every fired shot and refill on reload. Proven: 2 shots land, then the gun is dry.
+local TrackedGun  = nil
+local ShotsLeft   = 0
+local ReloadUntil = 0   -- os.clock() the in-progress reload completes at (0 = not reloading)
+
+-- re-seed when we switch to a different gun instance (equip / respawn / weapon swap)
+local function syncAmmo(tool)
+    if tool ~= TrackedGun then
+        TrackedGun  = tool
+        ShotsLeft   = gunAmmo(tool)   -- display is accurate at first sight, before we desync it
+        ReloadUntil = 0
+    end
+end
+
+local function reloadInProgress()
+    return ReloadUntil > 0
+end
+
+-- fire the real reload remote: pass the TOOL (the framework does `FireServer("Reload", TOOL)`)
+-- and flip Reloading_CLIENT so the gun's own gating treats us as mid-reload.
+local function startReload(tool)
+    MainEvent:FireServer('Reload', tool)
+    local be = bodyEffects(LocalPlayer.Character)
+    local rc = be and be:FindFirstChild('Reloading_CLIENT')
+    if rc then rc.Value = true end
+    ReloadUntil = os.clock() + GUN_RELOAD_TIME + 0.1
+end
+
+-- call every tick; once the reload window elapses the server has refilled, so top the counter up
+local function finishReloadIfDue(tool)
+    if ReloadUntil > 0 and os.clock() >= ReloadUntil then
+        ReloadUntil = 0
+        ShotsLeft   = gunMaxAmmo(tool)
+        local be = bodyEffects(LocalPlayer.Character)
+        local rc = be and be:FindFirstChild('Reloading_CLIENT')
+        if rc then rc.Value = false end
+    end
 end
 
 -- ============================================================= finisher blink
@@ -373,8 +421,17 @@ local function step()
         end
         if not (gun and inChar) then return end
 
-        if gunAmmo(gun) <= 0 then
-            if Toggles.AutoReload.Value then doReload() ; task.wait(0.3) end
+        syncAmmo(gun)
+
+        -- reload is non-blocking: when a reload is running, just let it finish on its own clock
+        if reloadInProgress() then
+            finishReloadIfDue(gun)
+            return
+        end
+
+        -- dry gun -> kick off a reload (server gives us exactly MaxAmmo rounds back)
+        if ShotsLeft <= 0 then
+            if Toggles.AutoReload.Value then startReload(gun) end
             return
         end
 
@@ -388,7 +445,10 @@ local function step()
         local delay = Options.FireDelay.Value
         if cd then delay = math.max(delay, cd + 0.05) end
         if (os.clock() - lastShot) >= delay then
-            if fireShot(gun, tChar) then lastShot = os.clock() end
+            if fireShot(gun, tChar) then
+                lastShot  = os.clock()
+                ShotsLeft = ShotsLeft - 1
+            end
         end
     end)
     busy = false
