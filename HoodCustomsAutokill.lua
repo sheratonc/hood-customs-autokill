@@ -274,7 +274,7 @@ Box:AddToggle('AutoEquip',{ Text = 'Auto-equip gun', Default = true, Tooltip = '
 Box:AddToggle('AutoReload',{ Text = 'Auto-reload',  Default = true, Tooltip = 'Reload when the clip is empty' })
 
 Box:AddSlider('MaxDistance', { Text = 'Max distance', Default = 200, Min = 10, Max = 500, Rounding = 0, Suffix = ' studs' })
-Box:AddSlider('FireDelay',   { Text = 'Shot delay', Default = 0.12, Min = 0.03, Max = 0.6, Rounding = 2, Suffix = 's' })
+Box:AddSlider('FireDelay',   { Text = 'Shot delay', Default = 0.35, Min = 0.15, Max = 0.8, Rounding = 2, Suffix = 's' })
 
 local FarmBox = Tabs.Main:AddRightGroupbox('Stomp farm')
 FarmBox:AddToggle('StompFarm', { Text = 'Stomp anyone under me', Default = false, Tooltip = 'Pure finisher spam — stomps any downed body beneath you (no blink)' })
