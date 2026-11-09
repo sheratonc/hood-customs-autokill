@@ -110,11 +110,20 @@ local function isKO(char)
     return ko ~= nil and ko.Value == true
 end
 
+-- BodyEffects.Dead flips false->true the moment a stomp finishes the kill; a dead body is
+-- spent, so we stop blinking onto it and let the next target take over.
+local function isDead(char)
+    local be = bodyEffects(char)
+    local dead = be and be:FindFirstChild('Dead')
+    return dead ~= nil and dead.Value == true
+end
+
 -- a character we can act on: present in the world with a root part
 local function validTarget(char)
     return char ~= nil
         and char.Parent ~= nil
         and char:FindFirstChild('HumanoidRootPart') ~= nil
+        and not isDead(char)
 end
 
 -- part we aim the silent-aim shot at
@@ -402,9 +411,9 @@ local function step()
         local myHRP = myChar and myChar:FindFirstChild('HumanoidRootPart')
         if not myHRP then return end
 
-        -- finisher phase
+        -- finisher phase (skip bodies already stomped to death)
         if isKO(tChar) then
-            if Toggles.UseStomp.Value then finisher(tChar) end
+            if Toggles.UseStomp.Value and not isDead(tChar) then finisher(tChar) end
             return
         end
 
