@@ -28,7 +28,36 @@ local Unloaded    = false -- the loop checks this and bails the instant we tear 
 
 -- ============================================================= helpers
 
-local ShotIndex = tick() % 1e6   -- unique-ish shot id seed; server uses INDEX to track shots
+-- The gun framework keeps ONE shared state table that owns the shot counter (INDEX).
+-- The server stays synced to that counter. If we invent our own index the server rejects
+-- the shot with ERROR_CLIENT_UNSYNCED_SERVER, so we grab the real table out of the GC and
+-- mirror its INDEX — incrementing it the same way the game's own gun script does.
+local GunState = nil
+local function getGunState()
+    if GunState and type(GunState) == 'table' and rawget(GunState, 'INDEX') ~= nil then
+        return GunState
+    end
+    GunState = nil
+    local ok, gc = pcall(getgc, true)
+    if not ok then return nil end
+    for _, v in ipairs(gc) do
+        if type(v) == 'table'
+            and rawget(v, 'PENDING') ~= nil
+            and rawget(v, 'INDEX')   ~= nil
+            and rawget(v, 'KNIVES')  ~= nil then
+            GunState = v
+            break
+        end
+    end
+    return GunState
+end
+
+local function nextShotIndex()
+    local st = getGunState()
+    if not st then return nil end
+    st.INDEX += 1          -- advance the real counter so the game's own script stays synced too
+    return st.INDEX
+end
 
 local function alive(char)
     if not char then return false end
@@ -86,6 +115,14 @@ local function resolveTarget()
     local myHRP = myChar and myChar:FindFirstChild('HumanoidRootPart')
     if not myHRP then return nil end
 
+    -- an explicit dropdown pick always wins; "Nearest" is only the fallback
+    local name = Options.TargetPlayer.Value
+    if name and name ~= '' then
+        local plr = Players:FindFirstChild(name)
+        if plr and alive(plr.Character) then return plr end
+        -- selected player is dead/gone; fall through to Nearest only if it's enabled
+    end
+
     if Toggles.Nearest.Value then
         local best, bestD = nil, math.huge
         local maxD = Options.MaxDistance.Value
@@ -99,11 +136,6 @@ local function resolveTarget()
         return best
     end
 
-    local name = Options.TargetPlayer.Value
-    if name and name ~= '' then
-        local plr = Players:FindFirstChild(name)
-        if plr and alive(plr.Character) then return plr end
-    end
     return nil
 end
 
@@ -120,15 +152,14 @@ local function fireShot(tool, targetChar)
     local _, torso = targetParts(targetChar)
     if not handle or not torso then return end
 
-    local origin = handle.Position
-    local aim    = torso.Position
-    ShotIndex = ShotIndex + 1
+    local idx = nextShotIndex()
+    if not idx then return end   -- no synced gun state yet; skip rather than desync the server
 
     -- single pellet straight at the torso, flagged as a landed hit (code 1)
     MainEvent:FireServer('Shoot', {
-        ORIGIN = origin,
-        AIM    = aim,
-        INDEX  = ShotIndex,
+        ORIGIN = handle.Position,
+        AIM    = torso.Position,
+        INDEX  = idx,
         HITS   = { [1] = 1 },
     })
 end
@@ -187,7 +218,7 @@ Box:AddDropdown('TargetPlayer', {
     ExcludeLocalPlayer = true,
 })
 
-Box:AddToggle('Nearest', { Text = 'Target nearest instead', Default = true, Tooltip = 'Auto-pick the closest living player' })
+Box:AddToggle('Nearest', { Text = 'Fallback to nearest', Default = true, Tooltip = 'When no dropdown target is picked (or it died), auto-target the closest living player' })
 Box:AddToggle('UseGun',  { Text = 'Shoot to down',  Default = true, Tooltip = 'Fire the gun at the target until they K.O' })
 Box:AddToggle('UseStomp',{ Text = 'Stomp to finish',Default = true, Tooltip = 'Fire the finisher once the target is downed' })
 Box:AddToggle('AutoEquip',{ Text = 'Auto-equip gun', Default = true, Tooltip = 'Pull a gun from the backpack if none is held' })
