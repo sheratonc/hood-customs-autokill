@@ -286,8 +286,13 @@ local function fireShot(tool, targetChar)
     return true
 end
 
+-- Burst the Stomp remote: the server resolves the K.O'd victim beneath our REPLICATED position, and
+-- on the frame right after a blink that position may not have landed server-side yet. Firing five
+-- times (spawned so none blocks) covers the replication gap so the finisher doesn't whiff.
 local function doStomp()
-    MainEvent:FireServer('Stomp')
+    for _ = 1, 5 do
+        task.spawn(function() MainEvent:FireServer('Stomp') end)
+    end
 end
 
 -- ---- ammo / reload tracking -----------------------------------------------------------
@@ -356,6 +361,17 @@ local function finisher(targetChar)
     if not myHRP or not body then return end
     if not canStomp() then return end
 
+    -- stomp-all's upright reset: if we're sat/ragdolled when we blink, the stomp can whiff.
+    -- Force us standing before the teleport so the LowerTorso raycast lands clean.
+    local myHum = myChar:FindFirstChildOfClass('Humanoid')
+    if myHum then
+        pcall(function()
+            myHum.Sit = false
+            myHum.PlatformStand = false
+            myHum:ChangeState(Enum.HumanoidStateType.GettingUp)
+        end)
+    end
+
     SavedCFrame = myHRP.CFrame
     -- sit just above the body so our LowerTorso raycast finds it
     myHRP.CFrame = CFrame.new(body.Position + Vector3.new(0, 2, 0))
@@ -367,6 +383,47 @@ local function finisher(targetChar)
     end
     task.wait(0.65)  -- stomp anim (~0.55) + settle
     restorePosition()
+end
+
+-- ============================================================= spectate
+-- Pure camera watch: point CurrentCamera.CameraSubject at the chosen player's Humanoid. This moves
+-- nothing about our own character — it just makes the camera follow them, exactly like the spectate
+-- in every other hub. Flip the toggle off (or unload) and the subject snaps back to our own body.
+local Spectating = false
+
+local function ownHumanoid()
+    local c = LocalPlayer.Character
+    return c and c:FindFirstChildOfClass('Humanoid')
+end
+
+local function stopSpectate()
+    local cam = workspace.CurrentCamera
+    local hum = ownHumanoid()
+    if cam and hum then pcall(function() cam.CameraSubject = hum end) end
+    Spectating = false
+end
+
+local function updateSpectate()
+    if not Toggles.Spectate.Value then
+        if Spectating then stopSpectate() end
+        return
+    end
+
+    local cam = workspace.CurrentCamera
+    if not cam then return end
+
+    local name = Options.SpectateTarget.Value
+    local plr  = name and name ~= '' and Players:FindFirstChild(name)
+    local hum  = plr and plr.Character and plr.Character:FindFirstChildOfClass('Humanoid')
+
+    if hum then
+        if cam.CameraSubject ~= hum then pcall(function() cam.CameraSubject = hum end) end
+        Spectating = true
+    elseif Spectating then
+        -- target left or is mid-respawn: hold on our own view until they're back
+        local own = ownHumanoid()
+        if own and cam.CameraSubject ~= own then pcall(function() cam.CameraSubject = own end) end
+    end
 end
 
 -- ============================================================= UI
@@ -406,6 +463,15 @@ Box:AddSlider('FireDelay',   { Text = 'Shot delay (floor)', Default = 0.35, Min 
 
 local FarmBox = Tabs.Main:AddRightGroupbox('Stomp farm')
 FarmBox:AddToggle('StompFarm', { Text = 'Stomp anyone under me', Default = false, Tooltip = 'Pure finisher spam — stomps any downed body beneath you (no blink)' })
+
+local SpecBox = Tabs.Main:AddRightGroupbox('Spectate')
+SpecBox:AddDropdown('SpectateTarget', {
+    SpecialType = 'Player',
+    Text = 'Spectate player',
+    Tooltip = 'Who the camera watches',
+    ExcludeLocalPlayer = true,
+})
+SpecBox:AddToggle('Spectate', { Text = 'Spectate', Default = false, Tooltip = 'Watch the selected player — camera only, your position never moves' })
 
 Box:AddLabel('Toggle autokill'):AddKeyPicker('AutokillKey', { Default = 'K', Mode = 'Toggle', Text = 'Autokill', SyncToggleState = true })
 
@@ -523,6 +589,7 @@ end
 
 Connections.Heartbeat = RunService.Heartbeat:Connect(function()
     pcall(step)
+    pcall(updateSpectate)
 end)
 
 -- ============================================================= teardown
@@ -542,6 +609,8 @@ local function teardown()
 
     -- put us back if a finisher blink left us parked on someone
     pcall(restorePosition)
+    -- snap the camera off a spectated player so unload doesn't leave us watching them
+    pcall(stopSpectate)
 
     getgenv().HoodCustoms_Unload = nil
 end
