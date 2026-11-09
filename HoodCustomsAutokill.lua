@@ -78,6 +78,19 @@ local function nextShotIndex()
     return st.INDEX
 end
 
+-- the server rate-limits the Shoot remote to the equipped gun's own fire interval
+-- (DATA.cooldown). shots sent faster than this get dropped, so we read it live and
+-- never fire below it. a small margin covers client/server clock skew.
+local function gunCooldown()
+    local st = getGunState()
+    local data = st and rawget(st, 'DATA')
+    if type(data) == 'table' then
+        local cd = tonumber(rawget(data, 'cooldown'))
+        if cd and cd > 0 then return cd end
+    end
+    return nil
+end
+
 -- ============================================================= target / state helpers
 
 local function bodyEffects(char)
@@ -274,7 +287,7 @@ Box:AddToggle('AutoEquip',{ Text = 'Auto-equip gun', Default = true, Tooltip = '
 Box:AddToggle('AutoReload',{ Text = 'Auto-reload',  Default = true, Tooltip = 'Reload when the clip is empty' })
 
 Box:AddSlider('MaxDistance', { Text = 'Max distance', Default = 200, Min = 10, Max = 500, Rounding = 0, Suffix = ' studs' })
-Box:AddSlider('FireDelay',   { Text = 'Shot delay', Default = 0.35, Min = 0.15, Max = 0.8, Rounding = 2, Suffix = 's' })
+Box:AddSlider('FireDelay',   { Text = 'Shot delay (floor)', Default = 0.35, Min = 0.15, Max = 0.8, Rounding = 2, Suffix = 's', Tooltip = "Minimum spacing between shots. The gun's own server cooldown overrides this upward, so shots are never dropped." })
 
 local FarmBox = Tabs.Main:AddRightGroupbox('Stomp farm')
 FarmBox:AddToggle('StompFarm', { Text = 'Stomp anyone under me', Default = false, Tooltip = 'Pure finisher spam — stomps any downed body beneath you (no blink)' })
@@ -370,7 +383,11 @@ local function step()
         local d = (part.Position - myHRP.Position).Magnitude
         if d > math.min(Options.MaxDistance.Value, GUN_RANGE) then return end
 
-        if (os.clock() - lastShot) >= Options.FireDelay.Value then
+        -- respect whichever is slower: the user's slider or the gun's real server cooldown
+        local cd = gunCooldown()
+        local delay = Options.FireDelay.Value
+        if cd then delay = math.max(delay, cd + 0.05) end
+        if (os.clock() - lastShot) >= delay then
             if fireShot(gun, tChar) then lastShot = os.clock() end
         end
     end)
